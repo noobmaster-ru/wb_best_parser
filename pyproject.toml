@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wb-best-parser"
+version = "0.1.0"
+description = "Telegram parser for forwarding interesting marketplace offers"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Kirill Kozlov" }
+]
+dependencies = [
+  "telethon==1.42.0",
+  "pydantic-settings==2.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

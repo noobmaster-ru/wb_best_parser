@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+sessions/*.session
+sessions/*.session-journal
+sessions/

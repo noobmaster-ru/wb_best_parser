@@ -1,0 +1,10 @@
+services:
+  parser:
+    build: .
+    container_name: wb_best_parser
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./sessions:/app/sessions
+      - ./targets.txt:/app/targets.txt:ro
