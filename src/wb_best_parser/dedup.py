@@ -50,6 +50,13 @@ class DedupStore:
         if self._dirty >= 25:
             self.flush()
 
+    def remove(self, key: str) -> None:
+        if key not in self._set:
+            return
+        self._set.discard(key)
+        self._items = deque(item for item in self._items if item != key)
+        self._dirty += 1
+
     def flush(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         content = "\n".join(self._items)

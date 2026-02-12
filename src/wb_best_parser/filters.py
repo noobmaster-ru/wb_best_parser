@@ -43,30 +43,29 @@ class OfferFilter:
 
         prices = [int(raw) for raw in self.price_pattern.findall(text)]
         if prices:
-            min_price = min(prices)
-            if min_price >= 500:
+            max_price = max(prices)
+            if max_price >= 1000 and max_price <= 1500:
                 score += 1
-                reasons.append(f"low_price:{min_price}")
-            elif min_price <= 1000:
+                reasons.append(f"low_price:{max_price}")
+            elif max_price >= 1500 and  max_price <= 2500:
                 score += 2
-                reasons.append(f"mid_price:{min_price}")
-            elif min_price <= 2000:
+                reasons.append(f"mid_price:{max_price}")
+            elif max_price >= 2500:
                 score += 3
-                reasons.append(f"mid_price:{min_price}")
-            else:
-                score += 4
+                reasons.append(f"big_price:{max_price}")
 
         discount_match = self.discount_pattern.search(text)
         if discount_match:
             discount = int(discount_match.group(1))
             if discount <= 50:
                 score += 1
-                reasons.append(f"big_discount:{discount}")
-            elif discount <= 80:
+                reasons.append(f"low_discount:{discount}")
+            elif discount >= 50 and discount <= 80:
                 score += 2
-                reasons.append(f"discount:{discount}")
-            else:
+                reasons.append(f"mid_discount:{discount}")
+            elif discount >= 80:
                 score += 3
+                reasons.append(f"big_discount:{discount}")
 
         is_interesting = score >= self.min_score
         return MatchResult(is_interesting=is_interesting, score=score, reasons=reasons)

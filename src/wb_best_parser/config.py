@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     dry_run: bool = Field(default=False, alias="DRY_RUN")
     dedup_store_file: str = Field(default="sessions/dedup_hashes.txt", alias="DEDUP_STORE_FILE")
     dedup_max_items: int = Field(default=5000, alias="DEDUP_MAX_ITEMS")
+    backfill_hours: int = Field(default=1, alias="BACKFILL_HOURS")
+    backfill_limit_per_chat: int = Field(default=200, alias="BACKFILL_LIMIT_PER_CHAT")
+    rewrite_with_ai: bool = Field(default=False, alias="REWRITE_WITH_AI")
+    openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
+    openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
+    openai_proxy: str = Field(default="", alias="OPENAI_PROXY")
 
     @field_validator("target_chat", mode="before")
     @classmethod
@@ -78,7 +84,7 @@ class Settings(BaseSettings):
         return chats
 
     @model_validator(mode="after")
-    def validate_required(self) -> "Settings":
+    def validate_required(self) -> Settings:
         if not self.target_chat:
             raise ValueError("TARGET_CHAT must be set")
         return self
