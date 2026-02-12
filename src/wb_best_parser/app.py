@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
 from pathlib import Path
 
 from telethon import TelegramClient, events
 
 from wb_best_parser.config import Settings, get_settings
+from wb_best_parser.dedup import DedupStore
 from wb_best_parser.filters import OfferFilter
 
 logging.basicConfig(
@@ -14,15 +16,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("wb_best_parser")
-
-
-def build_message_header(source_title: str, score: int, reasons: list[str]) -> str:
-    reason_text = ", ".join(reasons) if reasons else "no-reason"
-    return (
-        f"🔥 Интересное предложение\n"
-        f"Источник: {source_title}\n"
-        f"Score: {score} ({reason_text})"
-    )
+MEDIA_CAPTION_LIMIT = 1024
 
 
 def ensure_session_path(session_name: str) -> str:
@@ -34,13 +28,25 @@ def ensure_session_path(session_name: str) -> str:
 
 async def run(settings: Settings) -> None:
     session_name = ensure_session_path(settings.tg_session)
-    file_sources = settings.load_source_chats_from_file()
+    try:
+        file_sources = settings.load_source_chats_from_file()
+    except OSError as exc:
+        logger.warning(
+            "Failed reading %s (%s). Falling back to SOURCE_CHATS.",
+            settings.targets_file,
+            exc,
+        )
+        file_sources = []
     source_chats = file_sources or settings.source_chats_list()
 
     if not source_chats:
         raise ValueError(
             "No source chats configured. Fill targets.txt or SOURCE_CHATS in .env"
         )
+    if file_sources:
+        logger.info("Loaded %s source chats from %s", len(file_sources), settings.targets_file)
+    else:
+        logger.info("Loaded %s source chats from SOURCE_CHATS", len(source_chats))
 
     client = TelegramClient(
         session=session_name,
@@ -53,6 +59,11 @@ async def run(settings: Settings) -> None:
         exclude_keywords=settings.exclude_keywords_list(),
         min_score=settings.min_score,
     )
+    dedup_store = DedupStore(
+        path=settings.dedup_store_file,
+        max_items=settings.dedup_max_items,
+    )
+    dedup_lock = asyncio.Lock()
 
     source_entity_cache: dict[int, str] = {}
 
@@ -72,16 +83,38 @@ async def run(settings: Settings) -> None:
             source_entity_cache[chat_id] = getattr(chat, "title", None) or str(chat_id)
 
         source_title = source_entity_cache[chat_id]
-        header = build_message_header(source_title, result.score, result.reasons)
-        composed_text = f"{header}\n\n{text}".strip()
+        composed_text = text.strip()
+        fingerprint = DedupStore.fingerprint(composed_text)
+        if fingerprint:
+            async with dedup_lock:
+                if dedup_store.contains(fingerprint):
+                    logger.info("Skip duplicate post from %s (message_id=%s)", source_title, message.id)
+                    return
+                # Reserve fingerprint immediately to avoid race between concurrent events.
+                dedup_store.add(fingerprint)
+                dedup_store.flush()
 
         if settings.dry_run:
             logger.info("[DRY_RUN] matched from %s: %s", source_title, composed_text[:250])
             return
 
-        await client.send_message(settings.target_chat, composed_text)
         if message.media:
-            await client.forward_messages(settings.target_chat, message)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                downloaded_media = await client.download_media(message, file=tmpdir)
+                if downloaded_media:
+                    caption = composed_text[:MEDIA_CAPTION_LIMIT] if composed_text else None
+                    tail = composed_text[MEDIA_CAPTION_LIMIT:].strip() if composed_text else ""
+                    await client.send_file(
+                        settings.target_chat,
+                        file=downloaded_media,
+                        caption=caption,
+                    )
+                    if tail:
+                        await client.send_message(settings.target_chat, tail)
+                else:
+                    await client.send_message(settings.target_chat, composed_text)
+        else:
+            await client.send_message(settings.target_chat, composed_text)
 
         logger.info(
             "Published from %s (message_id=%s, score=%s)",

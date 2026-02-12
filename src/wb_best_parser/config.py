@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -27,6 +29,8 @@ class Settings(BaseSettings):
 
     min_score: int = Field(default=2, alias="MIN_SCORE")
     dry_run: bool = Field(default=False, alias="DRY_RUN")
+    dedup_store_file: str = Field(default="sessions/dedup_hashes.txt", alias="DEDUP_STORE_FILE")
+    dedup_max_items: int = Field(default=5000, alias="DEDUP_MAX_ITEMS")
 
     @field_validator("target_chat", mode="before")
     @classmethod
@@ -53,8 +57,20 @@ class Settings(BaseSettings):
         if not path.exists():
             return []
 
+        lines: list[str] = []
+        for attempt in range(3):
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                break
+            except OSError as exc:
+                if exc.errno == errno.EDEADLK and attempt < 2:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                raise
+
         chats: list[str] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in lines:
             value = line.strip()
             if not value or value.startswith("#"):
                 continue
