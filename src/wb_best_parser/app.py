@@ -128,22 +128,19 @@ async def run(settings: Settings) -> None:
 
         return resolved_entities, resolved_titles
 
-    async def publish_message(message, composed_text: str) -> None:
-        if message.media:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                downloaded_media = await client.download_media(message, file=tmpdir)
-                if downloaded_media:
-                    caption = composed_text[:MEDIA_CAPTION_LIMIT] if composed_text else None
-                    tail = composed_text[MEDIA_CAPTION_LIMIT:].strip() if composed_text else ""
-                    await client.send_file(
-                        settings.target_chat,
-                        file=downloaded_media,
-                        caption=caption,
-                    )
-                    if tail:
-                        await client.send_message(settings.target_chat, tail)
-                else:
-                    await client.send_message(settings.target_chat, composed_text)
+    async def publish_message(message, composed_text: str, downloaded_media: str | None) -> None:
+        if downloaded_media:
+            caption = composed_text[:MEDIA_CAPTION_LIMIT] if composed_text else None
+            tail = composed_text[MEDIA_CAPTION_LIMIT:].strip() if composed_text else ""
+            await client.send_file(
+                settings.target_chat,
+                file=downloaded_media,
+                caption=caption,
+            )
+            if tail:
+                await client.send_message(settings.target_chat, tail)
+        elif message.media:
+            await client.send_message(settings.target_chat, composed_text)
         else:
             await client.send_message(settings.target_chat, composed_text)
 
@@ -158,30 +155,69 @@ async def run(settings: Settings) -> None:
         composed_text = text.strip()
         if openai_gateway and composed_text:
             composed_text = await openai_gateway.rewrite_offer(composed_text)
-        fingerprint = DedupStore.fingerprint(composed_text)
-        reserved = False
-        if fingerprint:
+        text_fingerprint = DedupStore.fingerprint(composed_text)
+        media_fingerprint: str | None = None
+        media_temp_dir: tempfile.TemporaryDirectory[str] | None = None
+        downloaded_media: str | None = None
+
+        if message.media:
+            media_temp_dir = tempfile.TemporaryDirectory()
+            downloaded = await client.download_media(message, file=media_temp_dir.name)
+            if isinstance(downloaded, str):
+                downloaded_media = downloaded
+                if settings.dedup_media:
+                    try:
+                        media_bytes = Path(downloaded_media).read_bytes()
+                        raw_hash = DedupStore.fingerprint_bytes(media_bytes)
+                        media_fingerprint = f"img:{raw_hash}" if raw_hash else None
+                    except OSError as exc:
+                        logger.warning("Failed to hash media for message %s: %s", message.id, exc)
+
+        dedup_keys: list[str] = []
+        if text_fingerprint:
+            dedup_keys.append(f"txt:{text_fingerprint}")
+        if media_fingerprint:
+            dedup_keys.append(media_fingerprint)
+
+        reserved_keys: list[str] = []
+        if dedup_keys:
             async with dedup_lock:
-                if dedup_store.contains(fingerprint):
-                    logger.info("Skip duplicate post from %s (message_id=%s)", source_title, message.id)
+                duplicate_key = next((key for key in dedup_keys if dedup_store.contains(key)), None)
+                if duplicate_key:
+                    logger.info(
+                        "Skip duplicate post from %s (message_id=%s, key=%s)",
+                        source_title,
+                        message.id,
+                        duplicate_key,
+                    )
+                    if media_temp_dir:
+                        media_temp_dir.cleanup()
                     return
-                # Reserve fingerprint immediately to avoid race between concurrent events.
-                dedup_store.add(fingerprint)
+                for key in dedup_keys:
+                    dedup_store.add(key)
+                    reserved_keys.append(key)
                 dedup_store.flush()
-                reserved = True
 
         if settings.dry_run:
             logger.info("[DRY_RUN] matched from %s: %s", source_title, composed_text[:250])
+            if media_temp_dir:
+                media_temp_dir.cleanup()
             return
 
         try:
-            await publish_message(message, composed_text)
+            await publish_message(message, composed_text, downloaded_media)
         except Exception:
-            if fingerprint and reserved:
+            if reserved_keys:
                 async with dedup_lock:
-                    dedup_store.remove(fingerprint)
+                    for key in reserved_keys:
+                        dedup_store.remove(key)
                     dedup_store.flush()
+            if media_temp_dir:
+                media_temp_dir.cleanup()
             raise
+        finally:
+            if media_temp_dir:
+                media_temp_dir.cleanup()
 
         logger.info(
             "Published from %s (message_id=%s, score=%s, reasons=%s)",

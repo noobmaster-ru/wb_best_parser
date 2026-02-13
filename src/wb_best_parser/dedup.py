@@ -22,6 +22,12 @@ class DedupStore:
             return None
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def fingerprint_bytes(payload: bytes) -> str | None:
+        if not payload:
+            return None
+        return hashlib.sha256(payload).hexdigest()
+
     def _load(self) -> None:
         if not self.path.exists():
             return

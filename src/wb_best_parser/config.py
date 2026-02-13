@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     dry_run: bool = Field(default=False, alias="DRY_RUN")
     dedup_store_file: str = Field(default="sessions/dedup_hashes.txt", alias="DEDUP_STORE_FILE")
     dedup_max_items: int = Field(default=5000, alias="DEDUP_MAX_ITEMS")
+    dedup_media: bool = Field(default=True, alias="DEDUP_MEDIA")
     backfill_hours: int = Field(default=1, alias="BACKFILL_HOURS")
     backfill_limit_per_chat: int = Field(default=200, alias="BACKFILL_LIMIT_PER_CHAT")
     rewrite_with_ai: bool = Field(default=False, alias="REWRITE_WITH_AI")
