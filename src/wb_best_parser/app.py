@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -67,6 +69,7 @@ async def run(settings: Settings) -> None:
         max_items=settings.dedup_max_items,
     )
     dedup_lock = asyncio.Lock()
+    candidate_lock = asyncio.Lock()
     openai_gateway: OpenAIGateway | None = None
     if settings.rewrite_with_ai and settings.openai_api_key:
         openai_gateway = OpenAIGateway(
@@ -80,7 +83,19 @@ async def run(settings: Settings) -> None:
     elif settings.rewrite_with_ai and not settings.openai_api_key:
         logger.warning("REWRITE_WITH_AI is enabled but OPENAI_API_KEY is empty. AI rewrite disabled.")
 
+    @dataclass(slots=True)
+    class Candidate:
+        message: object
+        source_title: str
+        score: int
+        reasons: list[str]
+        composed_text: str
+        created_at: datetime
+
     source_entity_cache: dict[int, str] = {}
+    top_candidates: list[Candidate] = []
+    top_mode_enabled = settings.publish_top_n > 0
+    top_window_seconds = max(60, settings.top_window_minutes * 60)
 
     def parse_channel_id(raw_source: str) -> int | None:
         raw = raw_source.strip()
@@ -144,17 +159,13 @@ async def run(settings: Settings) -> None:
         else:
             await client.send_message(settings.target_chat, composed_text)
 
-    async def process_message(message, source_title: str) -> None:
-        text = message.message or ""
-        result = offer_filter.match(text)
-
-        if not result.is_interesting:
-            logger.debug("Skip message %s, score=%s", message.id, result.score)
-            return
-
-        composed_text = text.strip()
-        if openai_gateway and composed_text:
-            composed_text = await openai_gateway.rewrite_offer(composed_text)
+    async def publish_with_dedup(
+        message,
+        source_title: str,
+        composed_text: str,
+        score: int,
+        reasons: list[str],
+    ) -> bool:
         text_fingerprint = DedupStore.fingerprint(composed_text)
         media_fingerprint: str | None = None
         media_temp_dir: tempfile.TemporaryDirectory[str] | None = None
@@ -202,7 +213,7 @@ async def run(settings: Settings) -> None:
             logger.info("[DRY_RUN] matched from %s: %s", source_title, composed_text[:250])
             if media_temp_dir:
                 media_temp_dir.cleanup()
-            return
+            return True
 
         try:
             await publish_message(message, composed_text, downloaded_media)
@@ -223,8 +234,78 @@ async def run(settings: Settings) -> None:
             "Published from %s (message_id=%s, score=%s, reasons=%s)",
             source_title,
             message.id,
-            result.score,
-            result.reasons
+            score,
+            reasons,
+        )
+        return True
+
+    async def flush_top_candidates(reason: str) -> None:
+        if not top_mode_enabled:
+            return
+
+        async with candidate_lock:
+            if not top_candidates:
+                return
+            pending = list(top_candidates)
+            top_candidates.clear()
+
+        pending.sort(
+            key=lambda c: (c.score, c.created_at),
+            reverse=True,
+        )
+        selected = pending[: settings.publish_top_n]
+        logger.info(
+            "Top mode flush (%s): selected %s of %s candidate(s)",
+            reason,
+            len(selected),
+            len(pending),
+        )
+        for candidate in selected:
+            await publish_with_dedup(
+                message=candidate.message,
+                source_title=candidate.source_title,
+                composed_text=candidate.composed_text,
+                score=candidate.score,
+                reasons=candidate.reasons,
+            )
+
+    async def process_message(message, source_title: str) -> None:
+        text = message.message or ""
+        result = offer_filter.match(text)
+
+        if not result.is_interesting:
+            logger.debug("Skip message %s, score=%s", message.id, result.score)
+            return
+
+        composed_text = text.strip()
+        if openai_gateway and composed_text:
+            composed_text = await openai_gateway.rewrite_offer(composed_text)
+
+        if top_mode_enabled:
+            candidate = Candidate(
+                message=message,
+                source_title=source_title,
+                score=result.score,
+                reasons=result.reasons,
+                composed_text=composed_text,
+                created_at=datetime.now(UTC),
+            )
+            async with candidate_lock:
+                top_candidates.append(candidate)
+            logger.info(
+                "Top mode candidate added from %s (message_id=%s, score=%s)",
+                source_title,
+                message.id,
+                result.score,
+            )
+            return
+
+        await publish_with_dedup(
+            message=message,
+            source_title=source_title,
+            composed_text=composed_text,
+            score=result.score,
+            reasons=result.reasons,
         )
 
     async def on_new_message(event: events.NewMessage.Event) -> None:
@@ -269,6 +350,20 @@ async def run(settings: Settings) -> None:
                 len(recent_messages),
                 source_title,
             )
+        if top_mode_enabled:
+            await flush_top_candidates("backfill")
+
+    async def top_mode_loop() -> None:
+        if not top_mode_enabled:
+            return
+        logger.info(
+            "Top mode enabled: publishing top %s every %s minute(s)",
+            settings.publish_top_n,
+            settings.top_window_minutes,
+        )
+        while True:
+            await asyncio.sleep(top_window_seconds)
+            await flush_top_candidates("scheduled")
 
     await client.connect()
     if not await client.is_user_authorized():
@@ -283,8 +378,17 @@ async def run(settings: Settings) -> None:
 
     logger.info("Starting parser. Listening channels: %s", ", ".join(resolved_titles))
     client.add_event_handler(on_new_message, events.NewMessage(chats=resolved_entities))
+    top_task: asyncio.Task[None] | None = None
+    if top_mode_enabled:
+        top_task = asyncio.create_task(top_mode_loop())
     await process_backfill(resolved_entities)
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        if top_task:
+            top_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await top_task
 
 
 def main() -> None:

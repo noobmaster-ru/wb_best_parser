@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     dedup_media: bool = Field(default=True, alias="DEDUP_MEDIA")
     backfill_hours: int = Field(default=1, alias="BACKFILL_HOURS")
     backfill_limit_per_chat: int = Field(default=200, alias="BACKFILL_LIMIT_PER_CHAT")
+    publish_top_n: int = Field(default=5, alias="PUBLISH_TOP_N")
+    top_window_minutes: int = Field(default=1440, alias="TOP_WINDOW_MINUTES")
     rewrite_with_ai: bool = Field(default=False, alias="REWRITE_WITH_AI")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
