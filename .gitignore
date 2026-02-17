@@ -6,3 +6,5 @@ __pycache__/
 sessions/*.session
 sessions/*.session-journal
 
+.ruff_cache
+.mypy_cache
