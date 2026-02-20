@@ -69,7 +69,6 @@ async def run(settings: Settings) -> None:
         max_items=settings.dedup_max_items,
     )
     dedup_lock = asyncio.Lock()
-    candidate_lock = asyncio.Lock()
     openai_gateway: OpenAIGateway | None = None
     if settings.rewrite_with_ai and settings.openai_api_key:
         openai_gateway = OpenAIGateway(
@@ -89,11 +88,10 @@ async def run(settings: Settings) -> None:
         source_title: str
         score: int
         reasons: list[str]
-        composed_text: str
+        original_text: str
         created_at: datetime
 
     source_entity_cache: dict[int, str] = {}
-    top_candidates: list[Candidate] = []
     top_mode_enabled = settings.publish_top_n > 0
     top_window_seconds = max(60, settings.top_window_minutes * 60)
 
@@ -203,7 +201,7 @@ async def run(settings: Settings) -> None:
                     )
                     if media_temp_dir:
                         media_temp_dir.cleanup()
-                    return
+                    return False
                 for key in dedup_keys:
                     dedup_store.add(key)
                     reserved_keys.append(key)
@@ -239,81 +237,75 @@ async def run(settings: Settings) -> None:
         )
         return True
 
-    async def flush_top_candidates(reason: str) -> None:
-        if not top_mode_enabled:
-            return
+    def to_utc(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
-        async with candidate_lock:
-            if not top_candidates:
-                return
-            pending = list(top_candidates)
-            top_candidates.clear()
-
-        pending.sort(
-            key=lambda c: (c.score, c.created_at),
-            reverse=True,
-        )
-        selected = pending[: settings.publish_top_n]
-        logger.info(
-            "Top mode flush (%s): selected %s of %s candidate(s)",
-            reason,
-            len(selected),
-            len(pending),
-        )
-        for candidate in selected:
-            await publish_with_dedup(
-                message=candidate.message,
-                source_title=candidate.source_title,
-                composed_text=candidate.composed_text,
-                score=candidate.score,
-                reasons=candidate.reasons,
-            )
-
-    async def process_message(message, source_title: str) -> None:
+    async def build_candidate(message, source_title: str) -> Candidate | None:
         text = message.message or ""
         result = offer_filter.match(text)
 
         if not result.is_interesting:
             logger.debug("Skip message %s, score=%s", message.id, result.score)
-            return
+            return None
 
-        composed_text = text.strip()
+        created_at = to_utc(getattr(message, "date", None)) or datetime.now(UTC)
+        return Candidate(
+            message=message,
+            source_title=source_title,
+            score=result.score,
+            reasons=result.reasons,
+            original_text=text.strip(),
+            created_at=created_at,
+        )
+
+    async def publish_candidate(candidate: Candidate) -> bool:
+        composed_text = candidate.original_text
         if openai_gateway and composed_text:
             composed_text = await openai_gateway.rewrite_offer(composed_text)
 
-        if top_mode_enabled:
-            candidate = Candidate(
-                message=message,
-                source_title=source_title,
-                score=result.score,
-                reasons=result.reasons,
-                composed_text=composed_text,
-                created_at=datetime.now(UTC),
-            )
-            async with candidate_lock:
-                top_candidates.append(candidate)
-            logger.info(
-                "Top mode candidate added from %s (message_id=%s, score=%s)",
-                source_title,
-                message.id,
-                result.score,
-            )
-            return
-
         await publish_with_dedup(
-            message=message,
-            source_title=source_title,
+            message=candidate.message,
+            source_title=candidate.source_title,
             composed_text=composed_text,
-            score=result.score,
-            reasons=result.reasons,
+            score=candidate.score,
+            reasons=candidate.reasons,
         )
+        return True
+
+    def source_title_for_entity(entity) -> str:
+        title = getattr(entity, "title", None) or str(getattr(entity, "id", "unknown"))
+        entity_id = getattr(entity, "id", None)
+        if isinstance(entity_id, int):
+            source_entity_cache[entity_id] = title
+        return title
+
+    def select_top_candidates(candidates: list[Candidate], limit: int = 1) -> list[Candidate]:
+        candidates.sort(
+            key=lambda c: (
+                c.score,
+                c.created_at,
+                getattr(c.message, "id", 0),
+            ),
+            reverse=True,
+        )
+        return candidates[:limit]
+
+    async def process_message_immediate(message, source_title: str) -> None:
+        candidate = await build_candidate(message, source_title)
+        if not candidate:
+            return
+        await publish_candidate(candidate)
 
     async def on_new_message(event: events.NewMessage.Event) -> None:
         chat = await event.get_chat()
         chat_id = event.chat_id or 0
         if chat_id not in source_entity_cache:
             source_entity_cache[chat_id] = getattr(chat, "title", None) or str(chat_id)
-        await process_message(event.message, source_entity_cache[chat_id])
+        await process_message_immediate(event.message, source_entity_cache[chat_id])
 
     async def process_backfill(resolved_entities: list) -> None:
         if settings.backfill_hours <= 0:
@@ -324,46 +316,127 @@ async def run(settings: Settings) -> None:
 
         for entity in resolved_entities:
             try:
-                source_title = getattr(entity, "title", None) or str(getattr(entity, "id", "unknown"))
+                source_title = source_title_for_entity(entity)
             except Exception as exc:
                 logger.warning("Backfill skip source: %s", exc)
                 continue
 
             recent_messages = []
             async for msg in client.iter_messages(entity, limit=settings.backfill_limit_per_chat):
-                if not msg.date:
+                msg_date = to_utc(getattr(msg, "date", None))
+                if not msg_date:
                     continue
-                msg_date = (
-                    msg.date.replace(tzinfo=UTC)
-                    if msg.date.tzinfo is None
-                    else msg.date.astimezone(UTC)
-                )
                 if msg_date < since_utc:
                     break
                 recent_messages.append(msg)
 
             for msg in reversed(recent_messages):
-                await process_message(msg, source_title)
+                await process_message_immediate(msg, source_title)
 
             logger.info(
                 "Backfill checked %s message(s) for %s",
                 len(recent_messages),
                 source_title,
             )
-        if top_mode_enabled:
-            await flush_top_candidates("backfill")
 
-    async def top_mode_loop() -> None:
+    async def collect_candidates_for_window(
+        resolved_entities: list,
+        window_start_utc: datetime,
+        window_end_utc: datetime,
+    ) -> list[Candidate]:
+        candidates: list[Candidate] = []
+
+        for entity in resolved_entities:
+            source_title = source_title_for_entity(entity)
+            scanned_count = 0
+            matched_count = 0
+
+            async for msg in client.iter_messages(entity, limit=settings.backfill_limit_per_chat):
+                msg_date = to_utc(getattr(msg, "date", None))
+                if not msg_date:
+                    continue
+                if msg_date < window_start_utc:
+                    break
+                if msg_date > window_end_utc:
+                    continue
+
+                scanned_count += 1
+                candidate = await build_candidate(msg, source_title)
+                if not candidate:
+                    continue
+                matched_count += 1
+                candidates.append(candidate)
+
+            logger.info(
+                "Window scan: %s inspected=%s matched=%s",
+                source_title,
+                scanned_count,
+                matched_count,
+            )
+
+        return candidates
+
+    async def publish_window_top(
+        resolved_entities: list,
+        window_start_utc: datetime,
+        window_end_utc: datetime,
+        reason: str,
+    ) -> None:
+        candidates = await collect_candidates_for_window(
+            resolved_entities=resolved_entities,
+            window_start_utc=window_start_utc,
+            window_end_utc=window_end_utc,
+        )
+        if not candidates:
+            logger.info(
+                "Top mode flush (%s): no candidates for window %s -> %s",
+                reason,
+                window_start_utc.isoformat(),
+                window_end_utc.isoformat(),
+            )
+            return
+
+        selected = select_top_candidates(candidates, limit=1)
+        top_candidate = selected[0]
+        logger.info(
+            "Top mode flush (%s): selected message_id=%s score=%s from %s (candidates=%s)",
+            reason,
+            top_candidate.message.id,
+            top_candidate.score,
+            top_candidate.source_title,
+            len(candidates),
+        )
+        await publish_candidate(top_candidate)
+
+    async def top_mode_loop(resolved_entities: list) -> None:
         if not top_mode_enabled:
             return
         logger.info(
-            "Top mode enabled: publishing top %s every %s minute(s)",
-            settings.publish_top_n,
+            "Top mode enabled: publishing top1 every %s minute(s)",
             settings.top_window_minutes,
         )
+        initial_window_delta = (
+            timedelta(hours=settings.backfill_hours)
+            if settings.backfill_hours > 0
+            else timedelta(seconds=top_window_seconds)
+        )
+        window_start_utc = datetime.now(UTC) - initial_window_delta
+        next_run_utc = datetime.now(UTC)
         while True:
-            await asyncio.sleep(top_window_seconds)
-            await flush_top_candidates("scheduled")
+            now_utc = datetime.now(UTC)
+            sleep_seconds = (next_run_utc - now_utc).total_seconds()
+            if sleep_seconds > 0:
+                await asyncio.sleep(sleep_seconds)
+
+            window_end_utc = datetime.now(UTC)
+            await publish_window_top(
+                resolved_entities=resolved_entities,
+                window_start_utc=window_start_utc,
+                window_end_utc=window_end_utc,
+                reason="scheduled",
+            )
+            window_start_utc = window_end_utc
+            next_run_utc = window_end_utc + timedelta(seconds=top_window_seconds)
 
     await client.connect()
     if not await client.is_user_authorized():
@@ -377,11 +450,12 @@ async def run(settings: Settings) -> None:
         raise ValueError("No resolvable source channels/chats. Check targets.txt and account access.")
 
     logger.info("Starting parser. Listening channels: %s", ", ".join(resolved_titles))
-    client.add_event_handler(on_new_message, events.NewMessage(chats=resolved_entities))
     top_task: asyncio.Task[None] | None = None
     if top_mode_enabled:
-        top_task = asyncio.create_task(top_mode_loop())
-    await process_backfill(resolved_entities)
+        top_task = asyncio.create_task(top_mode_loop(resolved_entities))
+    else:
+        client.add_event_handler(on_new_message, events.NewMessage(chats=resolved_entities))
+        await process_backfill(resolved_entities)
     try:
         await client.run_until_disconnected()
     finally:
