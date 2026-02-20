@@ -163,8 +163,10 @@ async def run(settings: Settings) -> None:
         composed_text: str,
         score: int,
         reasons: list[str],
+        dedup_text: str | None = None,
     ) -> bool:
-        text_fingerprint = DedupStore.fingerprint(composed_text)
+        dedup_base_text = dedup_text if dedup_text is not None else composed_text
+        text_fingerprint = DedupStore.fingerprint(dedup_base_text)
         media_fingerprint: str | None = None
         media_temp_dir: tempfile.TemporaryDirectory[str] | None = None
         downloaded_media: str | None = None
@@ -237,6 +239,48 @@ async def run(settings: Settings) -> None:
         )
         return True
 
+    async def is_candidate_duplicate(candidate: Candidate) -> bool:
+        text_fingerprint = DedupStore.fingerprint(candidate.original_text)
+        text_key = f"txt:{text_fingerprint}" if text_fingerprint else None
+        media_key: str | None = None
+        media_temp_dir: tempfile.TemporaryDirectory[str] | None = None
+
+        if candidate.message.media and settings.dedup_media:
+            media_temp_dir = tempfile.TemporaryDirectory()
+            downloaded = await client.download_media(candidate.message, file=media_temp_dir.name)
+            if isinstance(downloaded, str):
+                try:
+                    media_bytes = Path(downloaded).read_bytes()
+                    media_hash = DedupStore.fingerprint_bytes(media_bytes)
+                    media_key = f"img:{media_hash}" if media_hash else None
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to hash media for duplicate pre-check message %s: %s",
+                        candidate.message.id,
+                        exc,
+                    )
+
+        dedup_keys = [key for key in (text_key, media_key) if key]
+        if not dedup_keys:
+            if media_temp_dir:
+                media_temp_dir.cleanup()
+            return False
+
+        async with dedup_lock:
+            duplicate_key = next((key for key in dedup_keys if dedup_store.contains(key)), None)
+
+        if media_temp_dir:
+            media_temp_dir.cleanup()
+
+        if duplicate_key:
+            logger.info(
+                "Top mode skip before rewrite: duplicate key=%s for message_id=%s from %s",
+                duplicate_key,
+                candidate.message.id,
+                candidate.source_title,
+            )
+        return duplicate_key is not None
+
     def to_utc(value: datetime | None) -> datetime | None:
         if value is None:
             return None
@@ -273,6 +317,7 @@ async def run(settings: Settings) -> None:
             composed_text=composed_text,
             score=candidate.score,
             reasons=candidate.reasons,
+            dedup_text=candidate.original_text,
         )
 
     def source_title_for_entity(entity) -> str:
@@ -398,26 +443,35 @@ async def run(settings: Settings) -> None:
             return
 
         ranked_candidates = select_top_candidates(candidates, limit=None)
-        logger.info(
-            "Top mode flush (%s): ranked %s candidate(s), trying publish top non-duplicate",
-            reason,
-            len(ranked_candidates),
-        )
-        for index, candidate in enumerate(ranked_candidates, start=1):
-            published = await publish_candidate(candidate)
-            if published:
-                logger.info(
-                    "Top mode flush (%s): published rank=%s message_id=%s score=%s from %s",
-                    reason,
-                    index,
-                    candidate.message.id,
-                    candidate.score,
-                    candidate.source_title,
-                )
-                return
+        score_groups: dict[int, list[Candidate]] = {}
+        for candidate in ranked_candidates:
+            score_groups.setdefault(candidate.score, []).append(candidate)
+
+        for score in sorted(score_groups, reverse=True):
+            group = score_groups[score]
+            logger.info(
+                "Top mode flush (%s): trying %s candidate(s) with score=%s",
+                reason,
+                len(group),
+                score,
+            )
+            for candidate in group:
+                if await is_candidate_duplicate(candidate):
+                    continue
+
+                published = await publish_candidate(candidate)
+                if published:
+                    logger.info(
+                        "Top mode flush (%s): published message_id=%s score=%s from %s",
+                        reason,
+                        candidate.message.id,
+                        candidate.score,
+                        candidate.source_title,
+                    )
+                    return
 
         logger.info(
-            "Top mode flush (%s): all ranked candidates are duplicates, nothing published",
+            "Top mode flush (%s): no non-duplicate candidates, nothing published",
             reason,
         )
 
