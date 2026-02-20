@@ -267,14 +267,13 @@ async def run(settings: Settings) -> None:
         if openai_gateway and composed_text:
             composed_text = await openai_gateway.rewrite_offer(composed_text)
 
-        await publish_with_dedup(
+        return await publish_with_dedup(
             message=candidate.message,
             source_title=candidate.source_title,
             composed_text=composed_text,
             score=candidate.score,
             reasons=candidate.reasons,
         )
-        return True
 
     def source_title_for_entity(entity) -> str:
         title = getattr(entity, "title", None) or str(getattr(entity, "id", "unknown"))
@@ -283,7 +282,7 @@ async def run(settings: Settings) -> None:
             source_entity_cache[entity_id] = title
         return title
 
-    def select_top_candidates(candidates: list[Candidate], limit: int = 1) -> list[Candidate]:
+    def select_top_candidates(candidates: list[Candidate], limit: int | None = None) -> list[Candidate]:
         candidates.sort(
             key=lambda c: (
                 c.score,
@@ -292,6 +291,8 @@ async def run(settings: Settings) -> None:
             ),
             reverse=True,
         )
+        if limit is None:
+            return candidates
         return candidates[:limit]
 
     async def process_message_immediate(message, source_title: str) -> None:
@@ -396,17 +397,29 @@ async def run(settings: Settings) -> None:
             )
             return
 
-        selected = select_top_candidates(candidates, limit=1)
-        top_candidate = selected[0]
+        ranked_candidates = select_top_candidates(candidates, limit=None)
         logger.info(
-            "Top mode flush (%s): selected message_id=%s score=%s from %s (candidates=%s)",
+            "Top mode flush (%s): ranked %s candidate(s), trying publish top non-duplicate",
             reason,
-            top_candidate.message.id,
-            top_candidate.score,
-            top_candidate.source_title,
-            len(candidates),
+            len(ranked_candidates),
         )
-        await publish_candidate(top_candidate)
+        for index, candidate in enumerate(ranked_candidates, start=1):
+            published = await publish_candidate(candidate)
+            if published:
+                logger.info(
+                    "Top mode flush (%s): published rank=%s message_id=%s score=%s from %s",
+                    reason,
+                    index,
+                    candidate.message.id,
+                    candidate.score,
+                    candidate.source_title,
+                )
+                return
+
+        logger.info(
+            "Top mode flush (%s): all ranked candidates are duplicates, nothing published",
+            reason,
+        )
 
     async def top_mode_loop(resolved_entities: list) -> None:
         if not top_mode_enabled:
