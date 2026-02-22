@@ -50,9 +50,12 @@ class OfferFilter:
             elif max_price >= 1500 and  max_price <= 2500:
                 score += 2
                 reasons.append(f"mid_price:{max_price}")
-            elif max_price >= 2500:
+            elif max_price >= 2500 and max_price <= 3500:
                 score += 3
                 reasons.append(f"big_price:{max_price}")
+            elif max_price >= 3500:
+                score += 4
+                reasons.append(f"biggest_price:{max_price}")
 
         discount_match = self.discount_pattern.search(text)
         if discount_match:
