@@ -1,5 +1,5 @@
 services:
-  parser:
+  wb_best_parser:
     build: .
     container_name: wb_best_parser
     restart: unless-stopped
