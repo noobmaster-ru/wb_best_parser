@@ -13,7 +13,10 @@ class MatchResult:
 
 class OfferFilter:
     price_pattern = re.compile(r"(?:^|\D)(\d{2,7})\s?(?:₽|руб|р|RUB)(?:\D|$)", re.IGNORECASE)
-    discount_pattern = re.compile(r"(?:-|скидк\w*\s*)(\d{1,2})\s?%", re.IGNORECASE)
+    discount_pattern = re.compile(
+        r"(?:(?:-|скидк\w*|к[еэ]шб[еэ]к\w*|cashback)\s*(?:до\s*)?)?(\d{1,2})\s?%",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -44,30 +47,36 @@ class OfferFilter:
         prices = [int(raw) for raw in self.price_pattern.findall(text)]
         if prices:
             max_price = max(prices)
-            if max_price >= 1000 and max_price <= 1500:
+            if max_price >= 500 and max_price < 1000:
                 score += 1
                 reasons.append(f"low_price:{max_price}")
-            elif max_price >= 1500 and  max_price <= 2500:
+            if max_price >= 1000 and max_price < 1500:
                 score += 2
-                reasons.append(f"mid_price:{max_price}")
-            elif max_price >= 2500 and max_price <= 3500:
+                reasons.append(f"low_price:{max_price}")
+            elif max_price >= 1500 and  max_price < 2500:
                 score += 3
+                reasons.append(f"mid_price:{max_price}")
+            elif max_price >= 2500 and max_price < 3500:
+                score += 4
                 reasons.append(f"big_price:{max_price}")
             elif max_price >= 3500:
-                score += 4
+                score += 5
                 reasons.append(f"biggest_price:{max_price}")
 
         discount_match = self.discount_pattern.search(text)
         if discount_match:
             discount = int(discount_match.group(1))
-            if discount <= 50:
+            if discount <= 30:
                 score += 1
-                reasons.append(f"low_discount:{discount}")
-            elif discount >= 50 and discount <= 80:
+                reasons.append(f"lowest_discount:{discount}")
+            elif discount > 30 and discount <= 50:
                 score += 2
-                reasons.append(f"mid_discount:{discount}")
-            elif discount >= 80:
+                reasons.append(f"low_discount:{discount}")
+            elif discount > 50 and discount <= 80:
                 score += 3
+                reasons.append(f"mid_discount:{discount}")
+            elif discount > 80:
+                score += 4
                 reasons.append(f"big_discount:{discount}")
 
         is_interesting = score >= self.min_score
