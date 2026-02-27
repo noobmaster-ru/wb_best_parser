@@ -23,10 +23,29 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           port: ${{ secrets.SERVER_PORT }}
           key: ${{ secrets.SERVER_SSH_KEY }}
+          passphrase: ${{ secrets.SERVER_SSH_PASSPHRASE }}
           script_stop: true
           script: |
             set -euo pipefail
             cd "${{ secrets.SERVER_APP_DIR }}"
             git pull --ff-only origin main
-            docker-compose up -d --build
-            docker-compose ps
+
+            if docker compose version >/dev/null 2>&1; then
+              compose() { docker compose "$@"; }
+              compose_kind="v2"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              compose() { docker-compose "$@"; }
+              compose_kind="v1"
+            else
+              echo "Docker Compose not found on server"
+              exit 1
+            fi
+
+            compose version
+
+            if [ "$compose_kind" = "v1" ]; then
+              docker rm -f wb_best_parser >/dev/null 2>&1 || true
+            fi
+
+            compose up -d --build --remove-orphans
+            compose ps
