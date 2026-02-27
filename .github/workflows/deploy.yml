@@ -44,7 +44,10 @@ jobs:
             compose version
 
             if [ "$compose_kind" = "v1" ]; then
-              docker rm -f wb_best_parser >/dev/null 2>&1 || true
+              # docker-compose v1 can crash on recreate with stale containers.
+              # Remove all containers for this service before `up`.
+              docker ps -aq --filter "label=com.docker.compose.service=wb_best_parser" | xargs -r docker rm -f
+              docker ps -aq --filter "name=wb_best_parser" | xargs -r docker rm -f
             fi
 
             compose up -d --build --remove-orphans
