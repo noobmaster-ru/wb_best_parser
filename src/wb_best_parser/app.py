@@ -7,12 +7,28 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from telethon import TelegramClient, events
 from telethon.utils import get_peer_id
 
 from infrastructure.openai import OpenAIConfig, OpenAIGateway
 from wb_best_parser.config import Settings, get_settings
+from wb_best_parser.constants import (
+    BACKFILL_HOURS,
+    BACKFILL_LIMIT_PER_CHAT,
+    DEDUP_MAX_ITEMS,
+    DEDUP_MEDIA,
+    DEDUP_STORE_FILE,
+    DRY_RUN,
+    EXCLUDE_KEYWORDS_LIST,
+    INCLUDE_KEYWORDS_LIST,
+    MIN_SCORE,
+    OPENAI_MODEL,
+    PUBLISH_TOP_N,
+    REWRITE_WITH_AI,
+    TOP_WINDOW_MINUTES,
+)
 from wb_best_parser.dedup import DedupStore
 from wb_best_parser.filters import OfferFilter
 
@@ -60,31 +76,31 @@ async def run(settings: Settings) -> None:
     )
 
     offer_filter = OfferFilter(
-        include_keywords=settings.include_keywords_list(),
-        exclude_keywords=settings.exclude_keywords_list(),
-        min_score=settings.min_score,
+        include_keywords=INCLUDE_KEYWORDS_LIST,
+        exclude_keywords=EXCLUDE_KEYWORDS_LIST,
+        min_score=MIN_SCORE,
     )
     dedup_store = DedupStore(
-        path=settings.dedup_store_file,
-        max_items=settings.dedup_max_items,
+        path=DEDUP_STORE_FILE,
+        max_items=DEDUP_MAX_ITEMS,
     )
     dedup_lock = asyncio.Lock()
     openai_gateway: OpenAIGateway | None = None
-    if settings.rewrite_with_ai and settings.openai_api_key:
+    if REWRITE_WITH_AI and settings.openai_api_key:
         openai_gateway = OpenAIGateway(
             OpenAIConfig(
                 openai_api_key=settings.openai_api_key,
-                model=settings.openai_model,
+                model=OPENAI_MODEL,
                 proxy=settings.openai_proxy,
             )
         )
-        logger.info("AI rewrite is enabled (%s)", settings.openai_model)
-    elif settings.rewrite_with_ai and not settings.openai_api_key:
+        logger.info("AI rewrite is enabled (%s)", OPENAI_MODEL)
+    elif REWRITE_WITH_AI and not settings.openai_api_key:
         logger.warning("REWRITE_WITH_AI is enabled but OPENAI_API_KEY is empty. AI rewrite disabled.")
 
     @dataclass(slots=True)
     class Candidate:
-        message: object
+        message: Any
         source_title: str
         score: int
         reasons: list[str]
@@ -92,8 +108,8 @@ async def run(settings: Settings) -> None:
         created_at: datetime
 
     source_entity_cache: dict[int, str] = {}
-    top_mode_enabled = settings.publish_top_n > 0
-    top_window_seconds = max(60, settings.top_window_minutes * 60)
+    top_mode_enabled = PUBLISH_TOP_N > 0
+    top_window_seconds = max(60, TOP_WINDOW_MINUTES * 60)
 
     def parse_channel_id(raw_source: str) -> int | None:
         raw = raw_source.strip()
@@ -176,7 +192,7 @@ async def run(settings: Settings) -> None:
             downloaded = await client.download_media(message, file=media_temp_dir.name)
             if isinstance(downloaded, str):
                 downloaded_media = downloaded
-                if settings.dedup_media:
+                if DEDUP_MEDIA:
                     try:
                         media_bytes = Path(downloaded_media).read_bytes()
                         raw_hash = DedupStore.fingerprint_bytes(media_bytes)
@@ -209,7 +225,7 @@ async def run(settings: Settings) -> None:
                     reserved_keys.append(key)
                 dedup_store.flush()
 
-        if settings.dry_run:
+        if DRY_RUN:
             logger.info("[DRY_RUN] matched from %s: %s", source_title, composed_text[:250])
             if media_temp_dir:
                 media_temp_dir.cleanup()
@@ -245,7 +261,7 @@ async def run(settings: Settings) -> None:
         media_key: str | None = None
         media_temp_dir: tempfile.TemporaryDirectory[str] | None = None
 
-        if candidate.message.media and settings.dedup_media:
+        if candidate.message.media and DEDUP_MEDIA:
             media_temp_dir = tempfile.TemporaryDirectory()
             downloaded = await client.download_media(candidate.message, file=media_temp_dir.name)
             if isinstance(downloaded, str):
@@ -354,11 +370,11 @@ async def run(settings: Settings) -> None:
         await process_message_immediate(event.message, source_entity_cache[chat_id])
 
     async def process_backfill(resolved_entities: list) -> None:
-        if settings.backfill_hours <= 0:
+        if BACKFILL_HOURS <= 0:
             return
 
-        since_utc = datetime.now(UTC) - timedelta(hours=settings.backfill_hours)
-        logger.info("Backfill started: checking last %s hour(s)", settings.backfill_hours)
+        since_utc = datetime.now(UTC) - timedelta(hours=BACKFILL_HOURS)
+        logger.info("Backfill started: checking last %s hour(s)", BACKFILL_HOURS)
 
         for entity in resolved_entities:
             try:
@@ -368,7 +384,7 @@ async def run(settings: Settings) -> None:
                 continue
 
             recent_messages = []
-            async for msg in client.iter_messages(entity, limit=settings.backfill_limit_per_chat):
+            async for msg in client.iter_messages(entity, limit=BACKFILL_LIMIT_PER_CHAT):
                 msg_date = to_utc(getattr(msg, "date", None))
                 if not msg_date:
                     continue
@@ -397,7 +413,7 @@ async def run(settings: Settings) -> None:
             scanned_count = 0
             matched_count = 0
 
-            async for msg in client.iter_messages(entity, limit=settings.backfill_limit_per_chat):
+            async for msg in client.iter_messages(entity, limit=BACKFILL_LIMIT_PER_CHAT):
                 msg_date = to_utc(getattr(msg, "date", None))
                 if not msg_date:
                     continue
@@ -480,11 +496,11 @@ async def run(settings: Settings) -> None:
             return
         logger.info(
             "Top mode enabled: publishing top1 every %s minute(s)",
-            settings.top_window_minutes,
+            TOP_WINDOW_MINUTES,
         )
         initial_window_delta = (
-            timedelta(hours=settings.backfill_hours)
-            if settings.backfill_hours > 0
+            timedelta(hours=BACKFILL_HOURS)
+            if BACKFILL_HOURS > 0
             else timedelta(seconds=top_window_seconds)
         )
         window_start_utc = datetime.now(UTC) - initial_window_delta

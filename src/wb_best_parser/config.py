@@ -24,21 +24,7 @@ class Settings(BaseSettings):
     source_chats: str = Field(default="", alias="SOURCE_CHATS")
     target_chat: str = Field(alias="TARGET_CHAT")
 
-    include_keywords: str = Field(default="", alias="INCLUDE_KEYWORDS")
-    exclude_keywords: str = Field(default="", alias="EXCLUDE_KEYWORDS")
-
-    min_score: int = Field(default=2, alias="MIN_SCORE")
-    dry_run: bool = Field(default=False, alias="DRY_RUN")
-    dedup_store_file: str = Field(default="sessions/dedup_hashes.txt", alias="DEDUP_STORE_FILE")
-    dedup_max_items: int = Field(default=5000, alias="DEDUP_MAX_ITEMS")
-    dedup_media: bool = Field(default=True, alias="DEDUP_MEDIA")
-    backfill_hours: int = Field(default=1, alias="BACKFILL_HOURS")
-    backfill_limit_per_chat: int = Field(default=200, alias="BACKFILL_LIMIT_PER_CHAT")
-    publish_top_n: int = Field(default=1, alias="PUBLISH_TOP_N")
-    top_window_minutes: int = Field(default=240, alias="TOP_WINDOW_MINUTES")
-    rewrite_with_ai: bool = Field(default=False, alias="REWRITE_WITH_AI")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
-    openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
     openai_proxy: str = Field(default="", alias="OPENAI_PROXY")
 
     @field_validator("target_chat", mode="before")
@@ -54,12 +40,6 @@ class Settings(BaseSettings):
 
     def source_chats_list(self) -> list[str]:
         return self.parse_csv(self.source_chats)
-
-    def include_keywords_list(self) -> list[str]:
-        return self.parse_csv(self.include_keywords)
-
-    def exclude_keywords_list(self) -> list[str]:
-        return self.parse_csv(self.exclude_keywords)
 
     def load_source_chats_from_file(self) -> list[str]:
         path = Path(self.targets_file)
