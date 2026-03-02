@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import tempfile
 from contextlib import suppress
@@ -17,6 +18,7 @@ from wb_best_parser.config import Settings, get_settings
 from wb_best_parser.constants import (
     BACKFILL_HOURS,
     BACKFILL_LIMIT_PER_CHAT,
+    CACHED_SCORE_THRESHOLD,
     DEDUP_MAX_ITEMS,
     DEDUP_MEDIA,
     DEDUP_STORE_FILE,
@@ -27,6 +29,9 @@ from wb_best_parser.constants import (
     OPENAI_MODEL,
     PUBLISH_TOP_N,
     REWRITE_WITH_AI,
+    TOP_CACHE_HASHES_FILE,
+    TOP_CACHE_ITEMS_FILE,
+    TOP_CACHE_MAX_ITEMS,
     TOP_WINDOW_MINUTES,
 )
 from wb_best_parser.dedup import DedupStore
@@ -84,7 +89,12 @@ async def run(settings: Settings) -> None:
         path=DEDUP_STORE_FILE,
         max_items=DEDUP_MAX_ITEMS,
     )
+    top_cache_store = DedupStore(
+        path=TOP_CACHE_HASHES_FILE,
+        max_items=TOP_CACHE_MAX_ITEMS,
+    )
     dedup_lock = asyncio.Lock()
+    top_cache_lock = asyncio.Lock()
     openai_gateway: OpenAIGateway | None = None
     if REWRITE_WITH_AI and settings.openai_api_key:
         openai_gateway = OpenAIGateway(
@@ -107,7 +117,21 @@ async def run(settings: Settings) -> None:
         original_text: str
         created_at: datetime
 
+    @dataclass(slots=True)
+    class CachedCandidate:
+        cache_key: str
+        source_title: str
+        source_peer_id: int | None
+        message_id: int
+        score: int
+        reasons: list[str]
+        original_text: str
+        created_at: str
+
     source_entity_cache: dict[int, str] = {}
+    source_entity_lookup: dict[int, Any] = {}
+    top_cached_candidates: list[CachedCandidate] = []
+    top_cache_items_path = Path(TOP_CACHE_ITEMS_FILE)
     top_mode_enabled = PUBLISH_TOP_N > 0
     top_window_seconds = max(60, TOP_WINDOW_MINUTES * 60)
 
@@ -150,8 +174,11 @@ async def run(settings: Settings) -> None:
             chat_id = getattr(entity, "id", None)
             if isinstance(chat_id, int):
                 source_entity_cache[chat_id] = title
+                source_entity_lookup[chat_id] = entity
             try:
-                source_entity_cache[get_peer_id(entity)] = title
+                peer_id = get_peer_id(entity)
+                source_entity_cache[peer_id] = title
+                source_entity_lookup[peer_id] = entity
             except Exception:
                 pass
 
@@ -336,11 +363,254 @@ async def run(settings: Settings) -> None:
             dedup_text=candidate.original_text,
         )
 
+    def candidate_cache_key(candidate: Candidate) -> str | None:
+        message_id = getattr(candidate.message, "id", None)
+        peer_id = None
+        with suppress(Exception):
+            peer = getattr(candidate.message, "peer_id", None)
+            if peer is not None:
+                peer_id = get_peer_id(peer)
+
+        if isinstance(peer_id, int) and isinstance(message_id, int):
+            return f"msg:{peer_id}:{message_id}"
+
+        text_fingerprint = DedupStore.fingerprint(candidate.original_text)
+        if text_fingerprint:
+            return f"txt:{text_fingerprint}"
+        return None
+
+    def parse_cached_created_at(raw_value: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(raw_value)
+        except ValueError:
+            return datetime.now(UTC)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def candidate_to_cached(candidate: Candidate) -> CachedCandidate | None:
+        cache_key = candidate_cache_key(candidate)
+        message_id = getattr(candidate.message, "id", None)
+        if not cache_key or not isinstance(message_id, int):
+            return None
+
+        source_peer_id: int | None = None
+        with suppress(Exception):
+            peer = getattr(candidate.message, "peer_id", None)
+            if peer is not None:
+                source_peer_id = get_peer_id(peer)
+
+        return CachedCandidate(
+            cache_key=cache_key,
+            source_title=candidate.source_title,
+            source_peer_id=source_peer_id,
+            message_id=message_id,
+            score=candidate.score,
+            reasons=list(candidate.reasons),
+            original_text=candidate.original_text,
+            created_at=candidate.created_at.isoformat(),
+        )
+
+    def load_top_cache_items() -> list[CachedCandidate]:
+        if not top_cache_items_path.exists():
+            return []
+
+        loaded: list[CachedCandidate] = []
+        try:
+            lines = top_cache_items_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            logger.warning("Top cache load failed (%s): %s", top_cache_items_path, exc)
+            return []
+
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+
+            cache_key = payload.get("cache_key")
+            source_title = payload.get("source_title")
+            message_id = payload.get("message_id")
+            score = payload.get("score")
+            original_text = payload.get("original_text")
+            created_at = payload.get("created_at")
+            reasons_raw = payload.get("reasons")
+            source_peer_raw = payload.get("source_peer_id")
+
+            if not isinstance(cache_key, str) or not cache_key:
+                continue
+            if not isinstance(source_title, str):
+                continue
+            if not isinstance(message_id, int):
+                continue
+            if not isinstance(score, int):
+                continue
+            if not isinstance(original_text, str):
+                continue
+            if not isinstance(created_at, str):
+                continue
+
+            reasons: list[str] = []
+            if isinstance(reasons_raw, list):
+                reasons = [value for value in reasons_raw if isinstance(value, str)]
+
+            source_peer_id = source_peer_raw if isinstance(source_peer_raw, int) else None
+            loaded.append(
+                CachedCandidate(
+                    cache_key=cache_key,
+                    source_title=source_title,
+                    source_peer_id=source_peer_id,
+                    message_id=message_id,
+                    score=score,
+                    reasons=reasons,
+                    original_text=original_text,
+                    created_at=created_at,
+                )
+            )
+
+        if len(loaded) > TOP_CACHE_MAX_ITEMS:
+            loaded = loaded[-TOP_CACHE_MAX_ITEMS:]
+        return loaded
+
+    def flush_top_cache_items() -> None:
+        payloads = [
+            json.dumps(
+                {
+                    "cache_key": item.cache_key,
+                    "source_title": item.source_title,
+                    "source_peer_id": item.source_peer_id,
+                    "message_id": item.message_id,
+                    "score": item.score,
+                    "reasons": item.reasons,
+                    "original_text": item.original_text,
+                    "created_at": item.created_at,
+                },
+                ensure_ascii=False,
+            )
+            for item in top_cached_candidates[-TOP_CACHE_MAX_ITEMS:]
+        ]
+        content = "\n".join(payloads)
+        if content:
+            content = f"{content}\n"
+        top_cache_items_path.parent.mkdir(parents=True, exist_ok=True)
+        top_cache_items_path.write_text(content, encoding="utf-8")
+
+    async def remove_from_top_cache(cache_key: str) -> None:
+        async with top_cache_lock:
+            previous_len = len(top_cached_candidates)
+            top_cached_candidates[:] = [item for item in top_cached_candidates if item.cache_key != cache_key]
+            if len(top_cached_candidates) != previous_len:
+                flush_top_cache_items()
+
+    async def materialize_cached_candidate(cached: CachedCandidate) -> Candidate | None:
+        if cached.source_peer_id is None:
+            return None
+
+        entity = source_entity_lookup.get(cached.source_peer_id)
+        if entity is None:
+            return None
+
+        cached_message = await client.get_messages(entity, ids=cached.message_id)
+        if isinstance(cached_message, list):
+            cached_message = cached_message[0] if cached_message else None
+        if not cached_message:
+            return None
+
+        created_at = to_utc(getattr(cached_message, "date", None)) or parse_cached_created_at(cached.created_at)
+        original_text = cached.original_text or (getattr(cached_message, "message", "") or "")
+        return Candidate(
+            message=cached_message,
+            source_title=cached.source_title,
+            score=cached.score,
+            reasons=list(cached.reasons),
+            original_text=original_text,
+            created_at=created_at,
+        )
+
+    loaded_cached_candidates = load_top_cache_items()
+    if loaded_cached_candidates:
+        top_cached_candidates.extend(loaded_cached_candidates)
+        for cached in loaded_cached_candidates:
+            top_cache_store.add(cached.cache_key)
+        top_cache_store.flush()
+        logger.info(
+            "Top cache: loaded %s candidate(s) from %s",
+            len(loaded_cached_candidates),
+            TOP_CACHE_ITEMS_FILE,
+        )
+
+    async def add_to_top_cache(candidates: list[Candidate]) -> None:
+        added = 0
+        async with top_cache_lock:
+            for candidate in candidates:
+                cached = candidate_to_cached(candidate)
+                if not cached or top_cache_store.contains(cached.cache_key):
+                    continue
+                top_cache_store.add(cached.cache_key)
+                top_cached_candidates.append(cached)
+                added += 1
+            if added:
+                if len(top_cached_candidates) > TOP_CACHE_MAX_ITEMS:
+                    top_cached_candidates[:] = top_cached_candidates[-TOP_CACHE_MAX_ITEMS:]
+                top_cache_store.flush()
+                flush_top_cache_items()
+        if added:
+            logger.info("Top cache: added %s candidate(s)", added)
+
+    async def publish_from_top_cache(reason: str) -> bool:
+        async with top_cache_lock:
+            ranked_cached = list(top_cached_candidates)
+        if not ranked_cached:
+            return False
+
+        ranked_cached.sort(
+            key=lambda c: (
+                c.score,
+                parse_cached_created_at(c.created_at),
+                c.message_id,
+            ),
+            reverse=True,
+        )
+        logger.info("Top mode flush (%s): trying %s cached candidate(s)", reason, len(ranked_cached))
+
+        for cached in ranked_cached:
+            candidate = await materialize_cached_candidate(cached)
+            if candidate is None:
+                await remove_from_top_cache(cached.cache_key)
+                continue
+
+            is_duplicate = await is_candidate_duplicate(candidate)
+            if not is_duplicate:
+                published = await publish_candidate(candidate)
+                if published:
+                    logger.info(
+                        "Top mode flush (%s): published from cache message_id=%s score=%s from %s",
+                        reason,
+                        candidate.message.id,
+                        candidate.score,
+                        candidate.source_title,
+                    )
+                await remove_from_top_cache(cached.cache_key)
+                return True
+            await remove_from_top_cache(cached.cache_key)
+
+        return False
+
     def source_title_for_entity(entity) -> str:
         title = getattr(entity, "title", None) or str(getattr(entity, "id", "unknown"))
         entity_id = getattr(entity, "id", None)
         if isinstance(entity_id, int):
             source_entity_cache[entity_id] = title
+            source_entity_lookup[entity_id] = entity
+        with suppress(Exception):
+            peer_id = get_peer_id(entity)
+            source_entity_cache[peer_id] = title
+            source_entity_lookup[peer_id] = entity
         return title
 
     def select_top_candidates(candidates: list[Candidate], limit: int | None = None) -> list[Candidate]:
@@ -450,17 +720,28 @@ async def run(settings: Settings) -> None:
             window_end_utc=window_end_utc,
         )
         if not candidates:
-            logger.info(
-                "Top mode flush (%s): no candidates for window %s -> %s",
-                reason,
-                window_start_utc.isoformat(),
-                window_end_utc.isoformat(),
-            )
+            published_from_cache = await publish_from_top_cache(reason)
+            if not published_from_cache:
+                logger.info(
+                    "Top mode flush (%s): no candidates for window %s -> %s",
+                    reason,
+                    window_start_utc.isoformat(),
+                    window_end_utc.isoformat(),
+                )
             return
 
         ranked_candidates = select_top_candidates(candidates, limit=None)
+        max_score = ranked_candidates[0].score
+        top_score_candidates = [c for c in ranked_candidates if c.score == max_score]
+
+        fresh_priority_candidates = [c for c in ranked_candidates if c.score > CACHED_SCORE_THRESHOLD]
+        fresh_fallback_candidates = [c for c in ranked_candidates if c.score <= CACHED_SCORE_THRESHOLD]
+
+        published_from_fresh = False
+        published_cache_key: str | None = None
+
         score_groups: dict[int, list[Candidate]] = {}
-        for candidate in ranked_candidates:
+        for candidate in fresh_priority_candidates:
             score_groups.setdefault(candidate.score, []).append(candidate)
 
         for score in sorted(score_groups, reverse=True):
@@ -477,6 +758,8 @@ async def run(settings: Settings) -> None:
 
                 published = await publish_candidate(candidate)
                 if published:
+                    published_from_fresh = True
+                    published_cache_key = candidate_cache_key(candidate)
                     logger.info(
                         "Top mode flush (%s): published message_id=%s score=%s from %s",
                         reason,
@@ -484,12 +767,52 @@ async def run(settings: Settings) -> None:
                         candidate.score,
                         candidate.source_title,
                     )
-                    return
+                    break
+            if published_from_fresh:
+                break
 
-        logger.info(
-            "Top mode flush (%s): no non-duplicate candidates, nothing published",
-            reason,
-        )
+        top_score_to_cache = [
+            candidate
+            for candidate in top_score_candidates
+            if candidate.score > CACHED_SCORE_THRESHOLD
+            and candidate_cache_key(candidate) != published_cache_key
+        ]
+        if top_score_to_cache:
+            await add_to_top_cache(top_score_to_cache)
+        if published_from_fresh:
+            return
+
+        if not fresh_priority_candidates:
+            published_from_cache = await publish_from_top_cache(reason)
+            if published_from_cache:
+                return
+
+            if fresh_fallback_candidates:
+                logger.info(
+                    "Top mode flush (%s): no score>%s, trying %s fresh fallback candidate(s)",
+                    reason,
+                    CACHED_SCORE_THRESHOLD,
+                    len(fresh_fallback_candidates),
+                )
+                for candidate in fresh_fallback_candidates:
+                    if await is_candidate_duplicate(candidate):
+                        continue
+                    published = await publish_candidate(candidate)
+                    if published:
+                        logger.info(
+                            "Top mode flush (%s): published fallback message_id=%s score=%s from %s",
+                            reason,
+                            candidate.message.id,
+                            candidate.score,
+                            candidate.source_title,
+                        )
+                        return
+
+        if not published_from_fresh:
+            logger.info(
+                "Top mode flush (%s): no non-duplicate candidates, nothing published",
+                reason,
+            )
 
     async def top_mode_loop(resolved_entities: list) -> None:
         if not top_mode_enabled:

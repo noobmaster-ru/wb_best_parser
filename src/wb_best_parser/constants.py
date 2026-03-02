@@ -14,8 +14,8 @@ DEDUP_STORE_FILE = "sessions/dedup_hashes.txt"
 INCLUDE_KEYWORDS = "ВБ,МП,распродажа,скидка,кэшбек,️КЭШБЕК"
 EXCLUDE_KEYWORDS = (
     "подготовка,подработка,опт,опт-дистрибуция,вакансия,исчерпали,НОСКИ,носки,"
-    "Оплата,оплата,Нужен,требуется,помощник,Уборка,Склад,склад,Разбор,разбор,"
-    "человека,Ищу,расчёт,Халтура,поддонов,Разбор"
+    "Оплата,оплата,Нужен,требуется,помощник,помощников,Уборка,Склад,склад,Разбор,разбор,"
+    "человека,Ищу,расчёт,Халтура,поддонов,Разбор,Возьму"
 )
 MIN_SCORE = 5
 
@@ -24,6 +24,13 @@ PUBLISH_TOP_N = 1
 TOP_WINDOW_MINUTES = 60
 BACKFILL_HOURS = 1
 BACKFILL_LIMIT_PER_CHAT = 20
+
+# Carryover cache:
+# if there are no fresh posts with score > CACHED_SCORE_THRESHOLD, publish from cache first
+CACHED_SCORE_THRESHOLD = 5
+TOP_CACHE_HASHES_FILE = "sessions/top_cache_hashes.txt"
+TOP_CACHE_ITEMS_FILE = "sessions/top_cache_items.jsonl"
+TOP_CACHE_MAX_ITEMS = 20000
 
 
 def parse_csv(value: str) -> list[str]:
