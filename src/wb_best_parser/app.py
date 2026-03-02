@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient, events
 from telethon.utils import get_peer_id
@@ -23,12 +24,18 @@ from wb_best_parser.constants import (
     DEDUP_MEDIA,
     DEDUP_STORE_FILE,
     DRY_RUN,
+    EVENING_PEAK_END_HOUR,
+    EVENING_PEAK_INTERVAL_MINUTES,
+    EVENING_PEAK_START_HOUR,
     EXCLUDE_KEYWORDS_LIST,
     INCLUDE_KEYWORDS_LIST,
     MIN_SCORE,
     OPENAI_MODEL,
     PUBLISH_TOP_N,
+    QUIET_END_HOUR,
+    QUIET_START_HOUR,
     REWRITE_WITH_AI,
+    SCHEDULE_TIMEZONE,
     TOP_CACHE_HASHES_FILE,
     TOP_CACHE_ITEMS_FILE,
     TOP_CACHE_MAX_ITEMS,
@@ -133,7 +140,9 @@ async def run(settings: Settings) -> None:
     top_cached_candidates: list[CachedCandidate] = []
     top_cache_items_path = Path(TOP_CACHE_ITEMS_FILE)
     top_mode_enabled = PUBLISH_TOP_N > 0
-    top_window_seconds = max(60, TOP_WINDOW_MINUTES * 60)
+    base_window_seconds = max(60, TOP_WINDOW_MINUTES * 60)
+    evening_peak_window_seconds = max(60, EVENING_PEAK_INTERVAL_MINUTES * 60)
+    schedule_tz = ZoneInfo(SCHEDULE_TIMEZONE)
 
     def parse_channel_id(raw_source: str) -> int | None:
         raw = raw_source.strip()
@@ -818,13 +827,22 @@ async def run(settings: Settings) -> None:
         if not top_mode_enabled:
             return
         logger.info(
-            "Top mode enabled: publishing top1 every %s minute(s)",
+            (
+                "Top mode enabled: timezone=%s, quiet=%02d:00-%02d:00, "
+                "day=%s min, evening_peak(%02d:00-%02d:00)=%s min"
+            ),
+            SCHEDULE_TIMEZONE,
+            QUIET_START_HOUR,
+            QUIET_END_HOUR,
             TOP_WINDOW_MINUTES,
+            EVENING_PEAK_START_HOUR,
+            EVENING_PEAK_END_HOUR,
+            EVENING_PEAK_INTERVAL_MINUTES,
         )
         initial_window_delta = (
             timedelta(hours=BACKFILL_HOURS)
             if BACKFILL_HOURS > 0
-            else timedelta(seconds=top_window_seconds)
+            else timedelta(seconds=base_window_seconds)
         )
         window_start_utc = datetime.now(UTC) - initial_window_delta
         next_run_utc = datetime.now(UTC)
@@ -835,6 +853,28 @@ async def run(settings: Settings) -> None:
                 await asyncio.sleep(sleep_seconds)
 
             window_end_utc = datetime.now(UTC)
+            local_now = window_end_utc.astimezone(schedule_tz)
+
+            if QUIET_START_HOUR <= local_now.hour < QUIET_END_HOUR:
+                local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+                local_morning_start = local_now.replace(
+                    hour=QUIET_END_HOUR,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                )
+                if local_now.hour >= QUIET_END_HOUR:
+                    local_morning_start += timedelta(days=1)
+
+                window_start_utc = local_midnight.astimezone(UTC)
+                next_run_utc = local_morning_start.astimezone(UTC)
+                logger.info(
+                    "Quiet window (%s): no publish until %s",
+                    SCHEDULE_TIMEZONE,
+                    local_morning_start.isoformat(),
+                )
+                continue
+
             await publish_window_top(
                 resolved_entities=resolved_entities,
                 window_start_utc=window_start_utc,
@@ -842,7 +882,13 @@ async def run(settings: Settings) -> None:
                 reason="scheduled",
             )
             window_start_utc = window_end_utc
-            next_run_utc = window_end_utc + timedelta(seconds=top_window_seconds)
+
+            if EVENING_PEAK_START_HOUR <= local_now.hour < EVENING_PEAK_END_HOUR:
+                interval_seconds = evening_peak_window_seconds
+            else:
+                interval_seconds = base_window_seconds
+
+            next_run_utc = window_end_utc + timedelta(seconds=interval_seconds)
 
     await client.connect()
     if not await client.is_user_authorized():
