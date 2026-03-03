@@ -514,6 +514,8 @@ async def run(settings: Settings) -> None:
             previous_len = len(top_cached_candidates)
             top_cached_candidates[:] = [item for item in top_cached_candidates if item.cache_key != cache_key]
             if len(top_cached_candidates) != previous_len:
+                top_cache_store.remove(cache_key)
+                top_cache_store.flush()
                 flush_top_cache_items()
 
     async def materialize_cached_candidate(cached: CachedCandidate) -> Candidate | None:
@@ -729,99 +731,80 @@ async def run(settings: Settings) -> None:
             window_end_utc=window_end_utc,
         )
         if not candidates:
-            published_from_cache = await publish_from_top_cache(reason)
-            if not published_from_cache:
-                logger.info(
-                    "Top mode flush (%s): no candidates for window %s -> %s",
-                    reason,
-                    window_start_utc.isoformat(),
-                    window_end_utc.isoformat(),
-                )
+            logger.info(
+                "Top mode flush (%s): no fresh candidates for window %s -> %s",
+                reason,
+                window_start_utc.isoformat(),
+                window_end_utc.isoformat(),
+            )
+
+        fresh_for_cache = [candidate for candidate in candidates if candidate.score > CACHED_SCORE_THRESHOLD]
+        if fresh_for_cache:
+            await add_to_top_cache(fresh_for_cache)
+
+        pool: list[tuple[Candidate, str | None]] = []
+        seen_keys: set[str] = set()
+
+        for candidate in candidates:
+            key = candidate_cache_key(candidate)
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            pool.append((candidate, key))
+
+        async with top_cache_lock:
+            cached_snapshot = list(top_cached_candidates)
+
+        for cached in cached_snapshot:
+            if cached.cache_key in seen_keys:
+                continue
+            cached_candidate = await materialize_cached_candidate(cached)
+            if cached_candidate is None:
+                await remove_from_top_cache(cached.cache_key)
+                continue
+            seen_keys.add(cached.cache_key)
+            pool.append((cached_candidate, cached.cache_key))
+
+        if not pool:
+            logger.info("Top mode flush (%s): no publishable candidates in fresh+cache pool", reason)
             return
 
-        ranked_candidates = select_top_candidates(candidates, limit=None)
-        max_score = ranked_candidates[0].score
-        top_score_candidates = [c for c in ranked_candidates if c.score == max_score]
+        pool.sort(
+            key=lambda entry: (
+                entry[0].score,
+                entry[0].created_at,
+                getattr(entry[0].message, "id", 0),
+            ),
+            reverse=True,
+        )
+        logger.info("Top mode flush (%s): ranked %s candidate(s) from fresh+cache", reason, len(pool))
 
-        fresh_priority_candidates = [c for c in ranked_candidates if c.score > CACHED_SCORE_THRESHOLD]
-        fresh_fallback_candidates = [c for c in ranked_candidates if c.score <= CACHED_SCORE_THRESHOLD]
+        for candidate, cache_key in pool:
+            if await is_candidate_duplicate(candidate):
+                if cache_key:
+                    await remove_from_top_cache(cache_key)
+                continue
 
-        published_from_fresh = False
-        published_cache_key: str | None = None
+            published = await publish_candidate(candidate)
+            if not published:
+                if cache_key:
+                    await remove_from_top_cache(cache_key)
+                continue
 
-        score_groups: dict[int, list[Candidate]] = {}
-        for candidate in fresh_priority_candidates:
-            score_groups.setdefault(candidate.score, []).append(candidate)
+            if cache_key:
+                await remove_from_top_cache(cache_key)
 
-        for score in sorted(score_groups, reverse=True):
-            group = score_groups[score]
             logger.info(
-                "Top mode flush (%s): trying %s candidate(s) with score=%s",
+                "Top mode flush (%s): published top1 message_id=%s score=%s from %s",
                 reason,
-                len(group),
-                score,
+                candidate.message.id,
+                candidate.score,
+                candidate.source_title,
             )
-            for candidate in group:
-                if await is_candidate_duplicate(candidate):
-                    continue
-
-                published = await publish_candidate(candidate)
-                if published:
-                    published_from_fresh = True
-                    published_cache_key = candidate_cache_key(candidate)
-                    logger.info(
-                        "Top mode flush (%s): published message_id=%s score=%s from %s",
-                        reason,
-                        candidate.message.id,
-                        candidate.score,
-                        candidate.source_title,
-                    )
-                    break
-            if published_from_fresh:
-                break
-
-        top_score_to_cache = [
-            candidate
-            for candidate in top_score_candidates
-            if candidate.score > CACHED_SCORE_THRESHOLD
-            and candidate_cache_key(candidate) != published_cache_key
-        ]
-        if top_score_to_cache:
-            await add_to_top_cache(top_score_to_cache)
-        if published_from_fresh:
             return
 
-        if not fresh_priority_candidates:
-            published_from_cache = await publish_from_top_cache(reason)
-            if published_from_cache:
-                return
-
-            if fresh_fallback_candidates:
-                logger.info(
-                    "Top mode flush (%s): no score>%s, trying %s fresh fallback candidate(s)",
-                    reason,
-                    CACHED_SCORE_THRESHOLD,
-                    len(fresh_fallback_candidates),
-                )
-                for candidate in fresh_fallback_candidates:
-                    if await is_candidate_duplicate(candidate):
-                        continue
-                    published = await publish_candidate(candidate)
-                    if published:
-                        logger.info(
-                            "Top mode flush (%s): published fallback message_id=%s score=%s from %s",
-                            reason,
-                            candidate.message.id,
-                            candidate.score,
-                            candidate.source_title,
-                        )
-                        return
-
-        if not published_from_fresh:
-            logger.info(
-                "Top mode flush (%s): no non-duplicate candidates, nothing published",
-                reason,
-            )
+        logger.info("Top mode flush (%s): all fresh+cache candidates are duplicates, nothing published", reason)
 
     async def top_mode_loop(resolved_entities: list) -> None:
         if not top_mode_enabled:
