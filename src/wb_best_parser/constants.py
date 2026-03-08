@@ -17,13 +17,13 @@ EXCLUDE_KEYWORDS = (
     "Оплата,оплата,Нужен,требуется,помощник,помощников,Уборка,Склад,склад,Разбор,разбор,"
     "человека,Ищу,расчёт,Халтура,поддонов,Разбор,Возьму"
 )
-MIN_SCORE = 5
+MIN_SCORE = 6
 
 # Top mode schedule
 PUBLISH_TOP_N = 1
-TOP_WINDOW_MINUTES = 120
+TOP_WINDOW_MINUTES = 60
 BACKFILL_HOURS = 1
-BACKFILL_LIMIT_PER_CHAT = 30
+BACKFILL_LIMIT_PER_CHAT = 40
 
 # Moscow schedule
 SCHEDULE_TIMEZONE = "Europe/Moscow"
