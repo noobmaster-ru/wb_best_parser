@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient, events
 from telethon.utils import get_peer_id
+import python_socks 
 
 from infrastructure.openai import OpenAIConfig, OpenAIGateway
 from wb_best_parser.config import Settings, get_settings
@@ -81,10 +82,19 @@ async def run(settings: Settings) -> None:
     else:
         logger.info("Loaded %s source chats from SOURCE_CHATS", len(source_chats))
 
+
+    proxy_config = {
+        'proxy_type': 'http', # или 'socks5', если прокси его поддерживает
+        'addr': '166.88.218.49',
+        'port': 63596,
+        'username': settings.proxy_username,     # подставьте ваш логин
+        'password': settings.proxy_password, # подставьте ваш пароль
+    }
     client = TelegramClient(
         session=session_name,
         api_id=settings.tg_api_id,
         api_hash=settings.tg_api_hash,
+        proxy=proxy_config  # Добавляем прокси сюда
     )
 
     offer_filter = OfferFilter(

@@ -4,19 +4,32 @@ import argparse
 import asyncio
 from getpass import getpass
 from pathlib import Path
-
+import os
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
-
+from dotenv import load_dotenv
 
 async def auth(api_id: int, api_hash: str, session: str, reset: bool) -> None:
     session_file = Path(f"{session}.session")
+    load_dotenv()
     if reset and session_file.exists():
         session_file.unlink()
         print(f"[auth] Removed existing session file: {session_file}", flush=True)
 
     print("[auth] Connecting to Telegram...", flush=True)
-    client = TelegramClient(session, api_id, api_hash)
+    proxy_config = {
+        'proxy_type': 'http', # или 'socks5', если прокси его поддерживает
+        'addr': '166.88.218.49',
+        'port': 63596,
+        'username': os.getenv("PROXY_USERNAME"),     # подставьте ваш логин
+        'password': os.getenv("PROXY_PASSWORD"), # подставьте ваш пароль
+    }
+    client = TelegramClient(
+        session=session, 
+        api_id=api_id, 
+        api_hash=api_hash,
+        proxy=proxy_config
+    )
     await client.connect()
 
     if await client.is_user_authorized():

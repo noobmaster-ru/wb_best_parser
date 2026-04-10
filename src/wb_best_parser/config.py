@@ -20,7 +20,10 @@ class Settings(BaseSettings):
     tg_api_hash: str = Field(alias="TG_API_HASH")
     tg_session: str = Field(default="sessions/user", alias="TG_SESSION")
     targets_file: str = Field(default="targets.txt", alias="TARGETS_FILE")
-
+    
+    proxy_username: str = Field(alias="PROXY_USERNAME")
+    proxy_password: str = Field(alias="PROXY_PASSWORD")
+    
     source_chats: str = Field(default="", alias="SOURCE_CHATS")
     target_chat: str = Field(alias="TARGET_CHAT")
 
