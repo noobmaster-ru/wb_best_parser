@@ -19,7 +19,7 @@ EXCLUDE_KEYWORDS = (
 )
 # Если нужно добавить ещё аккаунты, просто в одной строке через запятую:
 # пример: BLACKLISTED_TG_ACCOUNTS = "ElviXari27,another_user,@third_user".
-BLACKLISTED_TG_ACCOUNTS = "ElviXari27"
+BLACKLISTED_TG_ACCOUNTS = "ElviXari27,VegannovaBioherb"
 MIN_SCORE = 6
 
 # Top mode schedule
