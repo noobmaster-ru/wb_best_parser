@@ -17,16 +17,35 @@ class OfferFilter:
         r"(?:(?:-|скидк\w*|к[еэ]шб[еэ]к\w*|cashback)\s*(?:до\s*)?)?(\d{1,2})\s?%",
         re.IGNORECASE,
     )
+    mention_account_pattern = re.compile(r"@([a-zA-Z0-9_]{5,32})")
+    tme_account_pattern = re.compile(r"(?:https?://)?(?:t|telegram)\.me/([a-zA-Z0-9_]{5,32})", re.IGNORECASE)
+    tg_domain_pattern = re.compile(r"tg://resolve\?domain=([a-zA-Z0-9_]{5,32})", re.IGNORECASE)
 
     def __init__(
         self,
         include_keywords: list[str],
         exclude_keywords: list[str],
         min_score: int,
+        blacklisted_accounts: list[str] | None = None,
     ) -> None:
         self.include_keywords = [k.lower() for k in include_keywords]
         self.exclude_keywords = [k.lower() for k in exclude_keywords]
         self.min_score = min_score
+        self.blacklisted_accounts = {
+            account.strip().lstrip("@").lower()
+            for account in (blacklisted_accounts or [])
+            if account.strip()
+        }
+
+    def _extract_accounts(self, text: str) -> set[str]:
+        found: set[str] = set()
+        for pattern in (
+            self.mention_account_pattern,
+            self.tme_account_pattern,
+            self.tg_domain_pattern,
+        ):
+            found.update(value.lower() for value in pattern.findall(text))
+        return found
 
     def match(self, text: str | None) -> MatchResult:
         if not text:
@@ -35,6 +54,16 @@ class OfferFilter:
         normalized = text.lower()
         reasons: list[str] = []
         score = 0
+
+        if self.blacklisted_accounts:
+            mentioned_accounts = self._extract_accounts(text)
+            matched_blacklisted = sorted(mentioned_accounts & self.blacklisted_accounts)
+            if matched_blacklisted:
+                return MatchResult(
+                    is_interesting=False,
+                    score=0,
+                    reasons=[f"blacklisted_account:{','.join(matched_blacklisted)}"],
+                )
 
         if any(k in normalized for k in self.exclude_keywords):
             return MatchResult(is_interesting=False, score=0, reasons=["exclude_keyword"])

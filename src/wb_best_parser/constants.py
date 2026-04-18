@@ -17,6 +17,9 @@ EXCLUDE_KEYWORDS = (
     "Оплата,оплата,Нужен,требуется,помощник,помощников,Уборка,Склад,склад,Разбор,разбор,"
     "человека,Ищу,расчёт,Халтура,поддонов,Разбор,Возьму"
 )
+# Если нужно добавить ещё аккаунты, просто в одной строке через запятую:
+# пример: BLACKLISTED_TG_ACCOUNTS = "ElviXari27,another_user,@third_user".
+BLACKLISTED_TG_ACCOUNTS = "ElviXari27"
 MIN_SCORE = 6
 
 # Top mode schedule
@@ -49,3 +52,4 @@ def parse_csv(value: str) -> list[str]:
 
 INCLUDE_KEYWORDS_LIST = parse_csv(INCLUDE_KEYWORDS)
 EXCLUDE_KEYWORDS_LIST = parse_csv(EXCLUDE_KEYWORDS)
+BLACKLISTED_TG_ACCOUNTS_LIST = parse_csv(BLACKLISTED_TG_ACCOUNTS)

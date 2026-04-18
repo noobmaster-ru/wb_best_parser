@@ -13,13 +13,13 @@ from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient, events
 from telethon.utils import get_peer_id
-import python_socks 
 
 from infrastructure.openai import OpenAIConfig, OpenAIGateway
 from wb_best_parser.config import Settings, get_settings
 from wb_best_parser.constants import (
     BACKFILL_HOURS,
     BACKFILL_LIMIT_PER_CHAT,
+    BLACKLISTED_TG_ACCOUNTS_LIST,
     CACHED_SCORE_THRESHOLD,
     DEDUP_MAX_ITEMS,
     DEDUP_MEDIA,
@@ -101,6 +101,7 @@ async def run(settings: Settings) -> None:
         include_keywords=INCLUDE_KEYWORDS_LIST,
         exclude_keywords=EXCLUDE_KEYWORDS_LIST,
         min_score=MIN_SCORE,
+        blacklisted_accounts=BLACKLISTED_TG_ACCOUNTS_LIST,
     )
     dedup_store = DedupStore(
         path=DEDUP_STORE_FILE,
